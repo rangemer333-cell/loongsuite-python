@@ -217,7 +217,7 @@ libraries = [
         "instrumentation": "opentelemetry-instrumentation-urllib3==0.62b0.dev",
     },
     {
-        "library": "agentscope >= 1.0.0",
+        "library": "agentscope >= 1.0.0, < 3.0.0",
         "instrumentation": "loongsuite-instrumentation-agentscope==0.6.0.dev",
     },
     {
