@@ -245,6 +245,10 @@ libraries = [
         "instrumentation": "loongsuite-instrumentation-dashscope==0.6.0.dev",
     },
     {
+        "library": "deepagents >= 0.6.0, < 0.7.0",
+        "instrumentation": "loongsuite-instrumentation-deepagents==0.7.0.dev",
+    },
+    {
         "library": "google-adk >= 0.1.0",
         "instrumentation": "loongsuite-instrumentation-google-adk==0.6.0.dev",
     },
