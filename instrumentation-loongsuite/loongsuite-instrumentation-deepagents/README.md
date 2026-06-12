@@ -14,9 +14,13 @@ pip install loongsuite-instrumentation-deepagents
 from opentelemetry.instrumentation.deepagents import DeepAgentsInstrumentor
 
 DeepAgentsInstrumentor().instrument()
+
+from deepagents import create_deep_agent
 ```
 
-Instrument before creating DeepAgents graphs.
+When instrumenting manually, call `DeepAgentsInstrumentor().instrument()` before
+importing or binding `deepagents.create_deep_agent`. Auto-instrumentation runs
+before application imports and does not need this extra ordering step.
 
 ## What it does
 
