@@ -20,6 +20,7 @@ in the real (heavy) CUA dependencies. The tests then verify the patch is
 applied and removed correctly.
 """
 
+import os
 import sys
 import types
 
@@ -123,3 +124,43 @@ def test_repeated_instrument_idempotent_callback(tracer_provider):
         assert n_after_first == 1
     finally:
         instr1.uninstrument()
+
+
+def test_instrument_disables_cua_builtin_telemetry(tracer_provider, monkeypatch):
+    """Regression for review problem 1: instrument() must force
+    ``CUA_TELEMETRY_ENABLED=false`` so the built-in OtelCallback becomes a
+    no-op (it checks ``is_otel_enabled()`` on every hook), avoiding double
+    telemetry with this plugin.
+    """
+    mod_agent, _ = _install_stub_modules()
+    monkeypatch.setenv("CUA_TELEMETRY_ENABLED", "true")
+    from opentelemetry.instrumentation.cua import CuaInstrumentor
+
+    instrumentor = CuaInstrumentor()
+    instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+    try:
+        assert os.environ.get("CUA_TELEMETRY_ENABLED") == "false"
+    finally:
+        instrumentor.uninstrument()
+
+
+def test_uninstrument_restores_cua_telemetry_env(tracer_provider, monkeypatch):
+    """Regression for review problem 1: uninstrument() must restore the
+    original ``CUA_TELEMETRY_ENABLED`` value (set, unset, or user-provided).
+    """
+    mod_agent, _ = _install_stub_modules()
+    from opentelemetry.instrumentation.cua import CuaInstrumentor
+
+    # Case 1: previously unset -> after uninstrument, still unset
+    monkeypatch.delenv("CUA_TELEMETRY_ENABLED", raising=False)
+    instrumentor = CuaInstrumentor()
+    instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+    instrumentor.uninstrument()
+    assert "CUA_TELEMETRY_ENABLED" not in os.environ
+
+    # Case 2: previously user-set -> after uninstrument, original value restored
+    monkeypatch.setenv("CUA_TELEMETRY_ENABLED", "true")
+    instrumentor = CuaInstrumentor()
+    instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+    instrumentor.uninstrument()
+    assert os.environ.get("CUA_TELEMETRY_ENABLED") == "true"

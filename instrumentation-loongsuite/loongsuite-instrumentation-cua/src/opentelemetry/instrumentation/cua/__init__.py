@@ -44,6 +44,7 @@ Usage::
 """
 
 import logging
+import os
 from typing import Any, Collection, Optional
 
 from wrapt import wrap_function_wrapper
@@ -76,6 +77,8 @@ class CuaInstrumentor(BaseInstrumentor):
     """Instrumentor for the CUA (Computer-Use Agent) framework."""
 
     _handler: Optional[ExtendedTelemetryHandler] = None
+    _saved_cua_telemetry_enabled: Optional[str] = None
+    _telemetry_env_overridden: bool = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -93,6 +96,18 @@ class CuaInstrumentor(BaseInstrumentor):
             meter_provider=meter_provider,
             logger_provider=logger_provider,
         )
+
+        # Disable CUA's built-in OTel/PostHog telemetry to avoid double
+        # instrumentation. ``CUA_TELEMETRY_ENABLED=false`` causes
+        # ``OtelCallback``/``TelemetryCallback`` to no-op (they check
+        # ``is_otel_enabled()`` / ``is_telemetry_enabled()`` on every hook),
+        # even for agents constructed before this call.
+        if not CuaInstrumentor._telemetry_env_overridden:
+            CuaInstrumentor._saved_cua_telemetry_enabled = os.environ.get(
+                "CUA_TELEMETRY_ENABLED"
+            )
+            os.environ["CUA_TELEMETRY_ENABLED"] = "false"
+            CuaInstrumentor._telemetry_env_overridden = True
 
         # 1) Inject ArmsCuaCallback into ComputerAgent.__init__
         try:
@@ -148,6 +163,17 @@ class CuaInstrumentor(BaseInstrumentor):
             logger.debug("CUA: failed to unwrap Sandbox methods: %s", exc)
 
         CuaInstrumentor._handler = None
+
+        # Restore the original CUA_TELEMETRY_ENABLED value so user code that
+        # runs after uninstrument() sees its pre-instrumentation state.
+        if CuaInstrumentor._telemetry_env_overridden:
+            saved = CuaInstrumentor._saved_cua_telemetry_enabled
+            if saved is None:
+                os.environ.pop("CUA_TELEMETRY_ENABLED", None)
+            else:
+                os.environ["CUA_TELEMETRY_ENABLED"] = saved
+            CuaInstrumentor._saved_cua_telemetry_enabled = None
+            CuaInstrumentor._telemetry_env_overridden = False
 
 
 def _wrap_agent_init(wrapped, instance, args, kwargs):

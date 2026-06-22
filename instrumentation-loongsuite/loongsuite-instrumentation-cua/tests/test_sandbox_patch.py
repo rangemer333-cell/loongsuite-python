@@ -21,6 +21,7 @@ TASK spans with the right attributes.
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -111,6 +112,19 @@ def test_create_emits_task_span_with_sandbox_attrs():
     assert attrs["cua.sandbox.memory_mb"] == 2048
     assert attrs["cua.sandbox.region"] == "us-west-2"
     assert attrs["cua.sandbox.runtime"] == "_FakeRuntime"
+    # Regression for review problem 2: standard TASK input/output payloads
+    assert attrs["input.mime_type"] == "application/json"
+    assert attrs["output.mime_type"] == "application/json"
+    input_payload = json.loads(attrs["input.value"])
+    assert input_payload["image"] == "ubuntu:24.04"
+    assert input_payload["name"] == "sb-prod"
+    assert input_payload["local"] is True
+    assert input_payload["cpu"] == 4
+    assert input_payload["memory_mb"] == 2048
+    assert input_payload["region"] == "us-west-2"
+    output_payload = json.loads(attrs["output.value"])
+    assert output_payload["name"] == "sb-prod"
+    assert output_payload["runtime"] == "_FakeRuntime"
 
 
 def test_destroy_emits_task_span():
@@ -131,6 +145,12 @@ def test_destroy_emits_task_span():
     assert attrs["gen_ai.span.kind"] == "TASK"
     assert attrs["gen_ai.operation.name"] == "run_task"
     assert attrs["cua.sandbox.name"] == "sb-destroy"
+    # destroy has no output, but should still carry input payload
+    assert attrs["input.mime_type"] == "application/json"
+    input_payload = json.loads(attrs["input.value"])
+    assert input_payload["name"] == "sb-destroy"
+    assert "output.value" not in attrs
+    assert "output.mime_type" not in attrs
 
 
 def test_connect_emits_task_span():
@@ -152,6 +172,15 @@ def test_connect_emits_task_span():
     assert attrs["gen_ai.span.kind"] == "TASK"
     assert attrs["cua.sandbox.name"] == "existing-sb"
     assert attrs["cua.sandbox.local"] is False
+    # connect emits both input and output payloads
+    assert attrs["input.mime_type"] == "application/json"
+    assert attrs["output.mime_type"] == "application/json"
+    input_payload = json.loads(attrs["input.value"])
+    assert input_payload["name"] == "existing-sb"
+    assert input_payload["local"] is False
+    output_payload = json.loads(attrs["output.value"])
+    assert output_payload["name"] == "existing-sb"
+    assert output_payload["runtime"] == "_FakeRuntime"
 
 
 def test_disconnect_emits_task_span():
@@ -171,6 +200,12 @@ def test_disconnect_emits_task_span():
     attrs = dict(span.attributes or {})
     assert attrs["gen_ai.span.kind"] == "TASK"
     assert attrs["cua.sandbox.name"] == "sb-disconnect"
+    # disconnect carries input payload, no output
+    assert attrs["input.mime_type"] == "application/json"
+    input_payload = json.loads(attrs["input.value"])
+    assert input_payload["name"] == "sb-disconnect"
+    assert "output.value" not in attrs
+    assert "output.mime_type" not in attrs
 
 
 def test_create_failure_marks_error():
@@ -193,3 +228,101 @@ def test_create_failure_marks_error():
     attrs = dict(span.attributes or {})
     assert attrs["cua.sandbox.image"] == "ubuntu"
     assert attrs["cua.sandbox.name"] == "fail-sb"
+    # Even on failure, the input payload must be present (output is omitted)
+    assert attrs["input.mime_type"] == "application/json"
+    input_payload = json.loads(attrs["input.value"])
+    assert input_payload["image"] == "ubuntu"
+    assert input_payload["name"] == "fail-sb"
+    assert "output.value" not in attrs
+    assert "output.mime_type" not in attrs
+
+
+def test_task_span_input_output_payloads_regression():
+    """Regression for review problem 2/7c: every TASK span must carry
+    ``input.value``/``input.mime_type`` (all four wrappers) and
+    ``output.value``/``output.mime_type`` (create/connect only), as JSON
+    with ``application/json`` mime type — aligned with ``execute.md`` §4.7.
+    """
+    tracer, exporter = _make_tracer()
+
+    # create — input + output
+    create_wrapped = _wrap_create(tracer)
+
+    async def create_scenario():
+        return await create_wrapped(_async_create, None, ("ubuntu:24.04",), {
+            "name": "sb-create",
+            "local": True,
+            "cpu": 2,
+            "memory_mb": 1024,
+            "region": "us-east-1",
+        })
+
+    _run(create_scenario())
+    span = exporter.get_finished_spans()[-1]
+    attrs = dict(span.attributes or {})
+    assert attrs["input.mime_type"] == "application/json"
+    assert attrs["output.mime_type"] == "application/json"
+    create_input = json.loads(attrs["input.value"])
+    assert create_input == {
+        "image": "ubuntu:24.04",
+        "name": "sb-create",
+        "local": True,
+        "cpu": 2,
+        "memory_mb": 1024,
+        "region": "us-east-1",
+    }
+    create_output = json.loads(attrs["output.value"])
+    assert create_output["name"] == "sb-create"
+    assert create_output["runtime"] == "_FakeRuntime"
+
+    exporter.clear()
+
+    # connect — input + output, name positional
+    connect_wrapped = _wrap_connect(tracer)
+
+    async def connect_scenario():
+        return await connect_wrapped(_async_connect, None, ("sb-connect",), {"local": False})
+
+    _run(connect_scenario())
+    span = exporter.get_finished_spans()[-1]
+    attrs = dict(span.attributes or {})
+    assert attrs["input.mime_type"] == "application/json"
+    assert attrs["output.mime_type"] == "application/json"
+    connect_input = json.loads(attrs["input.value"])
+    assert connect_input == {"name": "sb-connect", "local": False}
+    connect_output = json.loads(attrs["output.value"])
+    assert connect_output["name"] == "sb-connect"
+
+    exporter.clear()
+
+    # destroy — input only
+    destroy_wrapped = _wrap_destroy(tracer)
+    sb = _FakeSandbox(name="sb-destroy")
+
+    async def destroy_scenario():
+        return await destroy_wrapped(_async_destroy, sb, (), {})
+
+    _run(destroy_scenario())
+    span = exporter.get_finished_spans()[-1]
+    attrs = dict(span.attributes or {})
+    assert attrs["input.mime_type"] == "application/json"
+    assert json.loads(attrs["input.value"]) == {"name": "sb-destroy"}
+    assert "output.value" not in attrs
+    assert "output.mime_type" not in attrs
+
+    exporter.clear()
+
+    # disconnect — input only
+    disconnect_wrapped = _wrap_disconnect(tracer)
+    sb = _FakeSandbox(name="sb-disconnect")
+
+    async def disconnect_scenario():
+        return await disconnect_wrapped(_async_disconnect, sb, (), {})
+
+    _run(disconnect_scenario())
+    span = exporter.get_finished_spans()[-1]
+    attrs = dict(span.attributes or {})
+    assert attrs["input.mime_type"] == "application/json"
+    assert json.loads(attrs["input.value"]) == {"name": "sb-disconnect"}
+    assert "output.value" not in attrs
+    assert "output.mime_type" not in attrs

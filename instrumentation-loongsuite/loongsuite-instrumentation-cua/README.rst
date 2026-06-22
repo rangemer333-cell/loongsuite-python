@@ -77,6 +77,37 @@ Configuration
   to enable.
 - ``OTEL_INSTRUMENTATION_GENAI_MESSAGE_CONTENT_MAX_LENGTH``: maximum length
   (in characters) of captured message content. Default 8192.
+- On ``instrument()``, the instrumentor forces
+  ``CUA_TELEMETRY_ENABLED=false`` to disable CUA's built-in
+  ``OtelCallback`` / ``TelemetryCallback`` (which would otherwise emit a
+  second, ARMS-unaligned trace to ``otel.cua.ai``). The original value is
+  restored on ``uninstrument()``.
+
+Known limitations
+-----------------
+
+The following are tracked for the next iteration and do not block deployment:
+
+- **STEP span close timing**: CUA executes tool calls *after* ``on_responses``
+  returns, so STEP is closed on the next ``on_llm_start`` (or ``on_run_end``)
+  rather than in ``on_responses`` to preserve the STEP → TOOL parent/child
+  link. See ``execute.md`` §4.3 for the deviation note.
+- **``uninstrument()`` does not strip ``ArmsCuaCallback`` from existing
+  ``ComputerAgent`` instances**. The class-level ``_handler`` is cleared on
+  uninstrument, so subsequent callback invocations become no-ops, but the
+  callback object remains in ``agent.callbacks``. A future iteration will
+  track instrumented instances and remove the callback explicitly.
+- **``gen_ai.tool.type = "computer_use"``** is an ARMS extension of the
+  semantic-convention enum (``function`` / ``extension`` / ``datastore``).
+  Consumers must recognise this value for CUA computer-use actions.
+- **``Sandbox.connect`` is patched at the sync entry** rather than the
+  recommended ``_connect`` async method (``execute.md`` §4.7). The
+  connection-duration therefore includes ``_ConnectResult`` construction
+  plus lazy await. Switch to patching ``_connect`` if sub-method
+  granularity is needed.
+- **``_fail_open_step_span`` in ``callback.py`` is currently unused**
+  (dead code); the single ``_close_open_step_span`` path is used for both
+  normal and fail-close. Will be removed or wired up in a future iteration.
 
 License
 -------
