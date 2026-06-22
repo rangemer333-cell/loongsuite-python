@@ -14,11 +14,13 @@
 
 """ARMS GenAI semantic-conventions Callback for CUA ComputerAgent."""
 
+import contextvars
 import logging
 import time
 from uuid import uuid4
 from typing import Any, Dict, List, Optional
 
+from opentelemetry import baggage, context as otel_context
 from opentelemetry.util.genai.extended_handler import ExtendedTelemetryHandler
 from opentelemetry.util.genai.extended_types import (
     EntryInvocation,
@@ -49,6 +51,15 @@ logger = logging.getLogger(__name__)
 GEN_AI_FRAMEWORK = "gen_ai.framework"
 _FRAMEWORK_VALUE = "cua"
 
+# Latest ENTRY span context observed in this async task. Used by
+# ``sandbox_patch._wrap_destroy`` to attach an OTel link from the
+# ``run_task sandbox.destroy`` TASK span back to the most recent ENTRY run,
+# so a single agent run's sandbox.create/destroy TASK spans are no longer
+# orphaned traces (per verification report 7ca3c1df P2.4).
+_latest_entry_span_context: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
+    "cua_latest_entry_span_context", default=None
+)
+
 
 def _text_part(text: Any) -> Text:
     return Text(content=str(text) if text is not None else "")
@@ -58,9 +69,16 @@ def _messages_to_input_messages(messages: Any) -> List[InputMessage]:
     """Convert a CUA/OpenAI-style messages list to ``InputMessage`` objects.
 
     CUA messages look like ``[{"role": "user", "content": "..."}]``. We accept
-    both plain strings and lists of content parts (OpenAI format).
+    both plain strings and lists of content parts (OpenAI format). We also
+    accept a bare ``str`` input: ``ComputerAgent.run("hello")`` is a valid CUA
+    shorthand that wraps the string into ``[{"role": "user", "content": str}]``
+    (see ``cua_agent.agent.ComputerAgent._process_input``); without this
+    normalization the ENTRY/AGENT spans drop ``gen_ai.input.messages`` even
+    though ``output.messages`` serializes correctly.
     """
     out: List[InputMessage] = []
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
     if not isinstance(messages, list):
         return out
     for msg in messages:
@@ -196,6 +214,12 @@ class ArmsCuaCallback:
         self._output_tokens: int = 0
         self._input_messages: List[Dict[str, Any]] = []
         self._last_responses: Optional[Dict[str, Any]] = None
+        # Token for the baggage context we attach on run start so that
+        # ``gen_ai.framework=cua`` propagates to LLM spans emitted by the
+        # LiteLLM/Anthropic/OpenAI instrumentors (which create their own spans
+        # and don't see the framework attribute the cua callback stamps on
+        # ENTRY/AGENT/STEP/TOOL/TASK). See verification report 7ca3c1df P2.3.
+        self._baggage_token: Optional[object] = None
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -209,6 +233,18 @@ class ArmsCuaCallback:
         self._output_tokens = 0
         self._input_messages = kwargs.get("messages") or []
 
+        # Attach ``gen_ai.framework=cua`` to the current OTel context as
+        # baggage. A span processor (registered by ``CuaInstrumentor``) reads
+        # this baggage on LLM span ``on_start`` and stamps the attribute on
+        # spans that don't already carry it (e.g. the ``chat`` LLM span
+        # emitted by ``loongsuite-instrumentation-litellm``).
+        try:
+            bag_ctx = baggage.set_baggage(GEN_AI_FRAMEWORK, _FRAMEWORK_VALUE)
+            self._baggage_token = otel_context.attach(bag_ctx)
+        except Exception as exc:
+            logger.debug("CUA: failed to attach framework baggage: %s", exc)
+            self._baggage_token = None
+
         session_id = str(uuid4())
         self._entry_inv = EntryInvocation(
             session_id=session_id,
@@ -221,6 +257,14 @@ class ArmsCuaCallback:
             logger.warning("CUA: start_entry failed: %s", exc)
             self._entry_inv = None
             return
+
+        # Publish the ENTRY span context so ``_wrap_destroy`` can add an OTel
+        # link from the destroy TASK span to this run (see P2.4).
+        try:
+            if self._entry_inv is not None and self._entry_inv.span is not None:
+                _latest_entry_span_context.set(self._entry_inv.span.get_span_context())
+        except Exception as exc:
+            logger.debug("CUA: failed to publish entry span context: %s", exc)
 
         model = kwargs.get("model") or getattr(self._agent, "model", None) or "unknown"
         provider = extract_provider_from_model(model)
@@ -303,6 +347,16 @@ class ArmsCuaCallback:
             except Exception as exc:
                 logger.warning("CUA: stop_entry failed: %s", exc)
             self._entry_inv = None
+
+        # Detach the framework baggage context attached in ``on_run_start``.
+        # Use a fresh try/except so a missing token (e.g. attach failed
+        # earlier) doesn't mask the run-end work above.
+        if self._baggage_token is not None:
+            try:
+                otel_context.detach(self._baggage_token)
+            except Exception as exc:
+                logger.debug("CUA: failed to detach framework baggage: %s", exc)
+            self._baggage_token = None
 
     async def on_run_continue(self, kwargs, old_items, new_items) -> bool:
         return True

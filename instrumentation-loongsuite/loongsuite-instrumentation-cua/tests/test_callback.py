@@ -367,3 +367,108 @@ def test_entry_agent_carry_messages_system_instructions_framework_ttft(
     # perf_counter reading, so the handler emits the attribute.
     assert "gen_ai.response.time_to_first_token" in agent_attrs
     assert agent_attrs["gen_ai.response.time_to_first_token"] > 0
+
+
+def test_string_input_messages_serialized_on_entry_agent(
+    span_exporter, handler
+):
+    """Regression for verification report 7ca3c1df P1.1.
+
+    ``ComputerAgent.run("hello")`` passes a bare string as ``messages``.
+    ``_messages_to_input_messages`` previously only handled lists, so the
+    ENTRY/AGENT spans dropped ``gen_ai.input.messages`` even though
+    ``output.messages`` was present. After the fix, a string input is
+    normalized to ``[{"role": "user", "content": str}]`` and serialized on
+    both ENTRY and AGENT.
+    """
+    import json as _json
+
+    agent = StubAgent(instructions="You are a helpful assistant")
+    cb = ArmsCuaCallback(handler, agent)
+
+    async def scenario():
+        await cb.on_run_start(
+            {"model": "anthropic/claude-sonnet-4-5", "messages": "Reply with hello"},
+            [],
+        )
+        await cb.on_llm_start([{"role": "user", "content": "Reply with hello"}])
+        await cb.on_responses(
+            {},
+            {"output": [{"role": "assistant", "content": "hello", "finish_reason": "stop"}]},
+        )
+        await cb.on_run_end({}, [], [])
+
+    _run(scenario())
+
+    spans = span_exporter.get_finished_spans()
+    entry = next(s for s in spans if s.name == "enter_ai_application_system")
+    agent_span = next(s for s in spans if s.name.startswith("invoke_agent"))
+
+    entry_attrs = dict(entry.attributes or {})
+    assert "gen_ai.input.messages" in entry_attrs, "ENTRY missing gen_ai.input.messages"
+    entry_input = _json.loads(entry_attrs["gen_ai.input.messages"])
+    assert entry_input[0]["role"] == "user"
+    assert entry_input[0]["parts"][0]["content"] == "Reply with hello"
+
+    agent_attrs = dict(agent_span.attributes or {})
+    assert "gen_ai.input.messages" in agent_attrs, "AGENT missing gen_ai.input.messages"
+    agent_input = _json.loads(agent_attrs["gen_ai.input.messages"])
+    assert agent_input[0]["role"] == "user"
+    assert agent_input[0]["parts"][0]["content"] == "Reply with hello"
+    # output.messages should also be present (regression for the "only
+    # output existed" half of the bug).
+    assert "gen_ai.output.messages" in agent_attrs
+    assert _json.loads(agent_attrs["gen_ai.output.messages"])[0]["role"] == "assistant"
+
+
+def test_framework_baggage_propagates_to_external_llm_span(
+    tracer_provider, span_exporter, handler
+):
+    """Regression for verification report 7ca3c1df P2.3.
+
+    The LLM span is emitted by an external instrumentor (litellm/anthropic)
+    which doesn't know about ``gen_ai.framework=cua``. The CUA callback
+    attaches the framework to OTel baggage in ``on_run_start``; a span
+    processor registered by ``CuaInstrumentor`` copies it onto any span
+    missing the attribute. Simulate an external LLM span started while the
+    CUA callback's baggage is active and verify it picks up ``cua``.
+    """
+    from opentelemetry.instrumentation.cua import (
+        CuaInstrumentor,
+        _register_framework_span_processor,
+    )
+    from opentelemetry.util.genai.extended_semconv.gen_ai_extended_attributes import (
+        GEN_AI_SPAN_KIND,
+    )
+
+    _register_framework_span_processor(tracer_provider)
+    CuaInstrumentor().instrument(tracer_provider=tracer_provider)
+    try:
+        agent = StubAgent(instructions="hi")
+        cb = ArmsCuaCallback(handler, agent)
+
+        async def scenario():
+            await cb.on_run_start(
+                {"model": "anthropic/claude-sonnet-4-5", "messages": "hello"}, []
+            )
+            # Simulate an external instrumentor (litellm) creating an LLM
+            # span while the baggage context attached by on_run_start is
+            # active. The span has no gen_ai.framework attribute of its own.
+            tracer = tracer_provider.get_tracer("external-litellm")
+            span = tracer.start_span(
+                "chat claude-sonnet-4-5",
+                attributes={GEN_AI_SPAN_KIND: "LLM"},
+            )
+            span.end()
+            await cb.on_run_end({}, [], [])
+
+        _run(scenario())
+
+        spans = span_exporter.get_finished_spans()
+        llm = next(s for s in spans if s.name == "chat claude-sonnet-4-5")
+        attrs = dict(llm.attributes or {})
+        assert attrs.get("gen_ai.framework") == "cua", (
+            "LLM span should inherit gen_ai.framework=cua from baggage"
+        )
+    finally:
+        CuaInstrumentor().uninstrument()

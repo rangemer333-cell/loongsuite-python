@@ -16,11 +16,11 @@
 
 import json
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace
-from opentelemetry.trace import SpanKind, Status, StatusCode, set_span_in_context
+from opentelemetry.trace import SpanKind, Status, StatusCode, Link, set_span_in_context
 from opentelemetry.util.genai.extended_semconv.gen_ai_extended_attributes import (
     GEN_AI_SPAN_KIND,
 )
@@ -35,6 +35,34 @@ _OUTPUT_MIME_TYPE = "application/json"
 
 GEN_AI_FRAMEWORK = "gen_ai.framework"
 _FRAMEWORK_VALUE = "cua"
+
+
+def _entry_span_link() -> List[Link]:
+    """Build a single-element ``links`` list pointing at the most recent CUA
+    ENTRY span context (if any), so the ``run_task sandbox.destroy`` TASK span
+    is no longer an orphan trace — it cross-references the agent run it
+    belongs to (per verification report 7ca3c1df P2.4).
+
+    Returns an empty list when no ENTRY has run yet (e.g. example 01's
+    standalone sandbox lifecycle test, or the destroy-before-run edge case),
+    in which case the destroy span stays a root span as before.
+    """
+    try:
+        # Lazy import to avoid any module-load ordering concerns.
+        from opentelemetry.instrumentation.cua.callback import (
+            _latest_entry_span_context,
+        )
+    except Exception:
+        return []
+    try:
+        ctx = _latest_entry_span_context.get()
+    except Exception:
+        return []
+    if ctx is None:
+        return []
+    if not getattr(ctx, "is_valid", False):
+        return []
+    return [Link(ctx)]
 
 
 def _apply_framework_attr(attrs: dict) -> None:
@@ -137,8 +165,19 @@ def _set_runtime_attrs(span: Any, sandbox: Any) -> None:
         span.set_attribute("cua.sandbox.transport", transport_cls)
 
 
-def _start_task_span(tracer: trace.Tracer, name: str, attrs: dict, input_payload: dict) -> Any:
-    """Start a TASK span with the standard ``input.value``/``input.mime_type``."""
+def _start_task_span(
+    tracer: trace.Tracer,
+    name: str,
+    attrs: dict,
+    input_payload: dict,
+    links: Optional[List[Link]] = None,
+) -> Any:
+    """Start a TASK span with the standard ``input.value``/``input.mime_type``.
+
+    ``links`` lets callers attach OTel links to related spans (e.g. linking a
+    ``run_task sandbox.destroy`` span to the most recent ENTRY span context so
+    the destroy TASK is no longer an orphan trace — see P2.4).
+    """
     _apply_framework_attr(attrs)
     final_attrs = {
         GEN_AI_SPAN_KIND: _span_kind_task(),
@@ -152,6 +191,7 @@ def _start_task_span(tracer: trace.Tracer, name: str, attrs: dict, input_payload
         name=name,
         kind=SpanKind.INTERNAL,
         attributes=final_attrs,
+        links=links or [],
     )
 
 
@@ -232,7 +272,13 @@ def _wrap_destroy(tracer: trace.Tracer) -> Callable:
         if name:
             input_payload["name"] = name
         attrs = _sandbox_destroy_attrs_from_instance(instance)
-        span = _start_task_span(tracer, "run_task sandbox.destroy", attrs, input_payload)
+        # Link to the most recent ENTRY span context so this destroy TASK
+        # span is no longer an orphan trace (P2.4). No-op when no ENTRY has
+        # run (e.g. example 01 sandbox-only lifecycle).
+        links = _entry_span_link()
+        span = _start_task_span(
+            tracer, "run_task sandbox.destroy", attrs, input_payload, links=links
+        )
         ctx = otel_context.attach(set_span_in_context(span))
         try:
             result = await wrapped(*args, **kwargs)

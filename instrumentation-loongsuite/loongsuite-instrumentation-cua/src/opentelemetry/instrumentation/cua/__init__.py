@@ -49,12 +49,15 @@ from typing import Any, Collection, Optional
 
 from wrapt import wrap_function_wrapper
 
+from opentelemetry import baggage, context as otel_context
 from opentelemetry.instrumentation.cua.package import _instruments
 from opentelemetry.instrumentation.cua.version import __version__
-from opentelemetry.instrumentation.cua.callback import ArmsCuaCallback
-from opentelemetry.instrumentation.cua.sandbox_patch import (
+from opentelemetry.instrumentation.cua.callback import (
+    ArmsCuaCallback,
     GEN_AI_FRAMEWORK,
     _FRAMEWORK_VALUE,
+)
+from opentelemetry.instrumentation.cua.sandbox_patch import (
     _apply_framework_attr,
     _wrap_connect,
     _wrap_destroy,
@@ -80,6 +83,61 @@ _ARMS_CALLBACK_ATTR = "_arms_cua_callback"
 # ``/home/admin/semantic-conventions/arms_docs/trace/gen-ai.md`` §"应用特征".
 _ARMS_SERVICE_FEATURE_KEY = "acs.arms.service.feature"
 _ARMS_SERVICE_FEATURE_VALUE = "genai_app"
+
+
+class _CuaFrameworkSpanProcessor:
+    """SpanProcessor that stamps ``gen_ai.framework`` from OTel baggage onto
+    spans that don't already carry the attribute.
+
+    The CUA callback sets ``gen_ai.framework=cua`` directly on ENTRY/AGENT/
+    STEP/TOOL/TASK spans via ``invocation.attributes``. LLM spans, however,
+    are emitted by an external instrumentor (``loongsuite-instrumentation-
+    litellm`` / ``opentelemetry-instrumentation-anthropic`` /
+    ``opentelemetry-instrumentation-openai-v2``) which doesn't know about the
+    CUA framework. The CUA callback attaches the framework to the active OTel
+    context as baggage in ``on_run_start``; this processor reads that baggage
+    on every span ``on_start`` and copies the framework attribute onto the
+    span if it isn't already present.
+
+    See verification report 7ca3c1df P2.3.
+    """
+
+    def on_start(self, span: Any, parent_context: Optional[Any] = None) -> None:
+        try:
+            ctx = parent_context if parent_context is not None else otel_context.get_current()
+            # ``baggage.get_value`` in some opentelemetry-api builds is a
+            # re-export of ``context.get_value`` (raw context lookup), which
+            # does NOT see baggage entries stored under the baggage key.
+            # ``baggage.get_all`` reads the baggage sub-dict correctly, so we
+            # use it and then pull the framework key.
+            framework = baggage.get_all(ctx).get(GEN_AI_FRAMEWORK)
+        except Exception:
+            return
+        if framework is None:
+            return
+        # Avoid double-stamping if the cua callback (or any other caller)
+        # already set the attribute. ``Span.attributes`` is generally empty at
+        # ``on_start`` for SDK spans (attributes are usually applied via
+        # ``set_attributes`` after creation), but we check defensively.
+        try:
+            existing = getattr(span, "attributes", None) or {}
+            if GEN_AI_FRAMEWORK in existing:
+                return
+        except Exception:
+            pass
+        try:
+            span.set_attribute(GEN_AI_FRAMEWORK, framework)
+        except Exception:
+            pass
+
+    def on_end(self, span: Any) -> None:  # pylint: disable=no-self-use
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:  # pylint: disable=unused-argument
+        return True
 
 
 def _merge_resource_attribute(tracer_provider: Any) -> None:
@@ -113,6 +171,38 @@ def _merge_resource_attribute(tracer_provider: Any) -> None:
         logger.debug("CUA: failed to merge resource attribute: %s", exc)
 
 
+# Tracks whether the framework span processor has been registered on a
+# given tracer provider, so re-instrumentation doesn't pile up duplicates.
+_framework_processor_providers: "set[int]" = set()
+
+
+def _register_framework_span_processor(tracer_provider: Any) -> None:
+    """Attach ``_CuaFrameworkSpanProcessor`` to ``tracer_provider`` (or the
+    global provider when ``tracer_provider`` is None). Idempotent per
+    provider object; silently skips when the SDK isn't available.
+    """
+    try:
+        provider = tracer_provider
+        if provider is None:
+            try:
+                from opentelemetry.trace import get_tracer_provider as _gtp
+                provider = _gtp()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("CUA: failed to resolve global tracer provider: %s", exc)
+                return
+        # ``add_span_processor`` exists on the SDK ``TracerProvider``.
+        add = getattr(provider, "add_span_processor", None)
+        if add is None:
+            return
+        key = id(provider)
+        if key in _framework_processor_providers:
+            return
+        add(_CuaFrameworkSpanProcessor())
+        _framework_processor_providers.add(key)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("CUA: failed to register framework span processor: %s", exc)
+
+
 class CuaInstrumentor(BaseInstrumentor):
     """Instrumentor for the CUA (Computer-Use Agent) framework."""
 
@@ -141,6 +231,13 @@ class CuaInstrumentor(BaseInstrumentor):
                 _merge_resource_attribute(_gtp())
             except Exception as exc:  # pylint: disable=broad-except
                 logger.debug("CUA: failed to tag global tracer provider: %s", exc)
+
+        # Register the framework-propagation span processor so LLM spans
+        # (emitted by the external litellm/anthropic/openai instrumentors)
+        # inherit ``gen_ai.framework=cua`` from the OTel baggage the callback
+        # attaches in ``on_run_start``. Idempotent: a class-level flag avoids
+        # duplicate registration on re-instrument.
+        _register_framework_span_processor(tracer_provider)
 
         CuaInstrumentor._handler = ExtendedTelemetryHandler(
             tracer_provider=tracer_provider,

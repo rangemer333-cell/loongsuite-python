@@ -570,3 +570,59 @@ def test_task_spans_carry_gen_ai_framework_cua():
     _run(ephemeral_scenario())
     span = exporter.get_finished_spans()[-1]
     assert dict(span.attributes or {}).get("gen_ai.framework") == "cua"
+
+
+def test_destroy_span_links_to_latest_entry_span_context():
+    """Regression for verification report 7ca3c1df P2.4.
+
+    When a CUA agent run has produced an ENTRY span, the ``run_task
+    sandbox.destroy`` TASK span should carry an OTel link back to that
+    ENTRY span context so the destroy span is no longer an orphan trace.
+    When no ENTRY has run (e.g. sandbox-only lifecycle), no link is added.
+    """
+    from opentelemetry.instrumentation.cua.callback import (
+        _latest_entry_span_context,
+    )
+
+    # 1) No ENTRY published yet → destroy span has no links.
+    tracer, exporter = _make_tracer()
+    destroy_wrapped = _wrap_destroy(tracer)
+    sb = _FakeSandbox(name="sb-no-entry")
+
+    async def scenario_no_entry():
+        return await destroy_wrapped(_async_destroy, sb, (), {})
+
+    _run(scenario_no_entry())
+    span = exporter.get_finished_spans()[-1]
+    assert len(span.links) == 0, (
+        "destroy span should have no links when no ENTRY has run"
+    )
+    exporter.clear()
+
+    # 2) ENTRY span context published → destroy span links to it.
+    tracer2, exporter2 = _make_tracer()
+    entry_tracer = tracer2
+    entry_span = entry_tracer.start_span("enter_ai_application_system")
+    entry_ctx = entry_span.get_span_context()
+    token = _latest_entry_span_context.set(entry_ctx)
+    try:
+        destroy_wrapped2 = _wrap_destroy(tracer2)
+        sb2 = _FakeSandbox(name="sb-with-entry")
+
+        async def scenario_with_entry():
+            return await destroy_wrapped2(_async_destroy, sb2, (), {})
+
+        _run(scenario_with_entry())
+    finally:
+        _latest_entry_span_context.reset(token)
+        entry_span.end()
+
+    spans = exporter2.get_finished_spans()
+    destroy_span = next(s for s in spans if s.name == "run_task sandbox.destroy")
+    assert len(destroy_span.links) == 1, (
+        "destroy span should carry exactly one link to the ENTRY span context"
+    )
+    link = destroy_span.links[0]
+    # The link's context span_id must match the ENTRY span's span_id.
+    assert link.context.span_id == entry_ctx.span_id
+    assert link.context.trace_id == entry_ctx.trace_id
