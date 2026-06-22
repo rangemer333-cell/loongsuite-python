@@ -70,6 +70,13 @@ from opentelemetry.instrumentation.utils import unwrap
 from opentelemetry.trace import get_tracer
 from opentelemetry.util.genai.extended_handler import ExtendedTelemetryHandler
 
+try:  # ``SpanProcessor`` lives in the SDK; guard for API-only environments.
+    from opentelemetry.sdk.trace import SpanProcessor
+except ImportError:  # pragma: no cover - exercised only without the SDK.
+    class SpanProcessor:  # type: ignore[no-redef]
+        """Fallback base class so module import never hard-fails without
+        the SDK. Real instrumentation requires ``opentelemetry-sdk``."""
+
 logger = logging.getLogger(__name__)
 
 _CUA_AGENT_MODULE = "cua_agent.agent"
@@ -85,7 +92,7 @@ _ARMS_SERVICE_FEATURE_KEY = "acs.arms.service.feature"
 _ARMS_SERVICE_FEATURE_VALUE = "genai_app"
 
 
-class _CuaFrameworkSpanProcessor:
+class _CuaFrameworkSpanProcessor(SpanProcessor):
     """SpanProcessor that stamps ``gen_ai.framework`` from OTel baggage onto
     spans that don't already carry the attribute.
 
@@ -130,7 +137,15 @@ class _CuaFrameworkSpanProcessor:
         except Exception:
             pass
 
-    def on_end(self, span: Any) -> None:  # pylint: disable=no-self-use
+    def on_end(self, span: Any) -> None:  # pylint: disable=no-self-use,unused-argument
+        pass
+
+    def _on_ending(self, span: Any) -> None:  # pylint: disable=no-self-use,unused-argument
+        # opentelemetry-sdk>=1.42 introduced ``_on_ending`` and calls it
+        # from ``Span.end()`` before ``on_end``. The ``SpanProcessor`` ABC
+        # provides a no-op there, but we redefine it explicitly so the
+        # processor also works on SDK<1.42 (where the base lacks the
+        # method entirely) — see verification 5173946b.
         pass
 
     def shutdown(self) -> None:

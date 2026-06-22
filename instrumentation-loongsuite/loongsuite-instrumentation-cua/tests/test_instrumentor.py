@@ -192,3 +192,47 @@ def test_instrument_tags_resource_with_genai_app_feature(tracer_provider):
         assert attrs.get("service.name") == original_service_name
     finally:
         instrumentor.uninstrument()
+
+
+def test_framework_span_processor_survives_on_ending_call(tracer_provider):
+    """Regression for verification 5173946b: ``_CuaFrameworkSpanProcessor``
+    must not crash when the SDK calls ``_on_ending`` on ``Span.end()``.
+
+    opentelemetry-sdk>=1.42 added a ``_on_ending`` hook invoked by
+    ``Span.end()`` before ``on_end``. ``SynchronousMultiSpanProcessor``
+    forwards it to every registered processor. A bare ``class
+    _CuaFrameworkSpanProcessor:`` raised ``AttributeError`` at runtime on
+    SDK 1.42 (the cluster pod), even though the local dev env (SDK 1.37)
+    didn't expose the hook and tests passed.
+
+    We can't easily install SDK 1.42 in CI, so we simulate the
+    multi-processor forwarding pattern: a fake multi-processor that
+    mimics SDK 1.42 by calling ``_on_ending`` then ``on_end`` on every
+    registered sp. If the class ever drops the ``_on_ending`` definition
+    again, this raises ``AttributeError``.
+    """
+    from opentelemetry.instrumentation.cua import _CuaFrameworkSpanProcessor
+
+    class _FakeSpan:
+        pass
+
+    class _FakeMultiProcessor:
+        """Mimics SDK 1.42 ``SynchronousMultiSpanProcessor``: ``Span.end()``
+        calls ``_on_ending`` then ``on_end`` on every registered sp."""
+
+        def __init__(self, sps):
+            self._sps = sps
+
+        def _on_ending(self, span):
+            for sp in self._sps:
+                sp._on_ending(span)
+
+        def on_end(self, span):
+            for sp in self._sps:
+                sp.on_end(span)
+
+    proc = _CuaFrameworkSpanProcessor()
+    multi = _FakeMultiProcessor([proc])
+    span = _FakeSpan()
+    multi._on_ending(span)  # Must not raise AttributeError.
+    multi.on_end(span)
