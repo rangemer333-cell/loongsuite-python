@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loongsuite-instrumentation-cua"
+dynamic = ["version"]
+description = "LoongSuite CUA (Computer-Use Agent) instrumentation"
+readme = "README.rst"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+  { name = "ARMS Authors", email = "arms-dev@alibaba-inc.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "opentelemetry-api ~= 1.37",
+  "opentelemetry-instrumentation ~= 0.58b0",
+  "opentelemetry-semantic-conventions ~= 0.58b0",
+  "wrapt >= 1.0.0, < 2.0.0",
+  "opentelemetry-util-genai",
+]
+
+[project.optional-dependencies]
+instruments = [
+  "cua-agent >= 0.1.0",
+  "cua-sandbox >= 0.1.0",
+]
+
+[project.entry-points.opentelemetry_instrumentor]
+cua = "opentelemetry.instrumentation.cua:CuaInstrumentor"
+
+[project.urls]
+Homepage = "https://github.com/alibaba/loongsuite-python-agent/tree/main/instrumentation-loongsuite/loongsuite-instrumentation-cua"
+Repository = "https://github.com/alibaba/loongsuite-python-agent"
+
+[tool.hatch.version]
+path = "src/opentelemetry/instrumentation/cua/version.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opentelemetry"]
