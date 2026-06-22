@@ -170,3 +170,25 @@ def test_uninstrument_restores_cua_telemetry_env(tracer_provider, monkeypatch):
     instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
     instrumentor.uninstrument()
     assert os.environ.get("CUA_TELEMETRY_ENABLED") == "true"
+
+
+def test_instrument_tags_resource_with_genai_app_feature(tracer_provider):
+    """Regression for verification non-blocking #4: instrument() must merge
+    ``acs.arms.service.feature=genai_app`` onto the tracer provider's resource
+    (per gen-ai.md §应用特征). Must not overwrite the user's existing
+    ``service.name``.
+    """
+    _install_stub_modules()
+    from opentelemetry.instrumentation.cua import CuaInstrumentor
+
+    # Tag the provider's resource so we can verify it survives the merge.
+    original_service_name = tracer_provider.resource.attributes.get("service.name")
+    instrumentor = CuaInstrumentor()
+    instrumentor.instrument(tracer_provider=tracer_provider, skip_dep_check=True)
+    try:
+        attrs = dict(tracer_provider.resource.attributes or {})
+        assert attrs.get("acs.arms.service.feature") == "genai_app"
+        # User's existing service.name must be preserved.
+        assert attrs.get("service.name") == original_service_name
+    finally:
+        instrumentor.uninstrument()

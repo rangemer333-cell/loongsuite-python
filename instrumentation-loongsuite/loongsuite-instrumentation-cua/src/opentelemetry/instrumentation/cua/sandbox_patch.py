@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 _INPUT_MIME_TYPE = "application/json"
 _OUTPUT_MIME_TYPE = "application/json"
 
+GEN_AI_FRAMEWORK = "gen_ai.framework"
+_FRAMEWORK_VALUE = "cua"
+
+
+def _apply_framework_attr(attrs: dict) -> None:
+    """Stamp ``gen_ai.framework=cua`` on a sandbox TASK span attribute dict."""
+    attrs[GEN_AI_FRAMEWORK] = _FRAMEWORK_VALUE
+
 
 def _span_kind_task() -> str:
     return "TASK"
@@ -131,6 +139,7 @@ def _set_runtime_attrs(span: Any, sandbox: Any) -> None:
 
 def _start_task_span(tracer: trace.Tracer, name: str, attrs: dict, input_payload: dict) -> Any:
     """Start a TASK span with the standard ``input.value``/``input.mime_type``."""
+    _apply_framework_attr(attrs)
     final_attrs = {
         GEN_AI_SPAN_KIND: _span_kind_task(),
         "gen_ai.operation.name": "run_task",
@@ -178,13 +187,51 @@ def _wrap_create(tracer: trace.Tracer) -> Callable:
     return wrapper
 
 
+def _sandbox_destroy_attrs_from_instance(instance: Any) -> dict:
+    """Build cua.sandbox.* attributes from a Sandbox instance at destroy time.
+
+    ``Sandbox.create`` records image/local/cpu/memory_mb/region at creation;
+    ``destroy`` only has the live instance. We mirror those fields back when
+    the instance still exposes them so destroy spans carry the same context
+    (per execute.md §4.7 — destroy span should mirror create's cua.sandbox.*).
+    """
+    attrs: dict = {}
+    if instance is None:
+        return attrs
+    name = getattr(instance, "name", None)
+    if name:
+        attrs["cua.sandbox.name"] = name
+    image = getattr(instance, "image", None) or getattr(instance, "_image", None)
+    if image is not None:
+        attrs["cua.sandbox.image"] = str(image)
+    local = getattr(instance, "local", None)
+    if local is not None:
+        attrs["cua.sandbox.local"] = bool(local)
+    cpu = getattr(instance, "cpu", None)
+    if cpu is not None:
+        attrs["cua.sandbox.cpu"] = cpu
+    memory_mb = getattr(instance, "memory_mb", None)
+    if memory_mb is not None:
+        attrs["cua.sandbox.memory_mb"] = memory_mb
+    region = getattr(instance, "region", None)
+    if region is not None:
+        attrs["cua.sandbox.region"] = region
+    runtime = getattr(instance, "_runtime", None)
+    if runtime is not None:
+        attrs["cua.sandbox.runtime"] = type(runtime).__name__
+    transport = getattr(instance, "_transport", None)
+    if transport is not None:
+        attrs["cua.sandbox.transport"] = type(transport).__name__
+    return attrs
+
+
 def _wrap_destroy(tracer: trace.Tracer) -> Callable:
     async def wrapper(wrapped, instance, args, kwargs):
         name = getattr(instance, "name", None) if instance is not None else None
-        input_payload = {"name": name} if name else {}
-        attrs: dict = {}
+        input_payload: dict = {}
         if name:
-            attrs["cua.sandbox.name"] = name
+            input_payload["name"] = name
+        attrs = _sandbox_destroy_attrs_from_instance(instance)
         span = _start_task_span(tracer, "run_task sandbox.destroy", attrs, input_payload)
         ctx = otel_context.attach(set_span_in_context(span))
         try:

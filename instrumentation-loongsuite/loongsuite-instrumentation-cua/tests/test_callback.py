@@ -278,3 +278,92 @@ def test_no_content_capture_omits_arguments(span_exporter, instrument_no_content
 async def on_function_call_end_safe(cb, item, result):
     # Tiny helper so the test doesn't depend on the private import path
     await cb.on_function_call_end(item, result)
+
+
+def test_entry_agent_carry_messages_system_instructions_framework_ttft(
+    span_exporter, handler
+):
+    """Regression for verification non-blocking #3-#5: ENTRY/AGENT must
+    serialize ``gen_ai.input.messages`` / ``gen_ai.output.messages`` /
+    ``gen_ai.system_instructions`` / ``gen_ai.tool.definitions`` (when
+    SPAN_ONLY is on), stamp public ``gen_ai.framework=cua``, and AGENT must
+    emit ``gen_ai.response.time_to_first_token``.
+    """
+    import json as _json
+
+    agent = StubAgent(instructions="You are a helpful assistant")
+    agent.tool_schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {"type": "computer", "computer": object()},
+    ]
+    cb = ArmsCuaCallback(handler, agent)
+
+    async def scenario():
+        await cb.on_run_start(
+            {
+                "model": "anthropic/claude-sonnet-4-5",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ],
+            },
+            [],
+        )
+        await cb.on_llm_start([{"role": "user", "content": "hi"}])
+        await cb.on_responses(
+            {},
+            {"output": [{"role": "assistant", "content": "ok", "finish_reason": "stop"}]},
+        )
+        await cb.on_run_end({}, [], [])
+
+    _run(scenario())
+
+    spans = span_exporter.get_finished_spans()
+    by_name = {s.name: s for s in spans}
+    entry = by_name["enter_ai_application_system"]
+    agent_span = next(s for s in spans if s.name.startswith("invoke_agent"))
+
+    # Public gen_ai.framework on every span kind.
+    for s in spans:
+        assert dict(s.attributes or {}).get("gen_ai.framework") == "cua", s.name
+
+    # ENTRY: input.messages (ENTRY handler does not emit tool.definitions
+    # or system_instructions — those are only on AGENT).
+    entry_attrs = dict(entry.attributes or {})
+    assert "gen_ai.input.messages" in entry_attrs
+    entry_input = _json.loads(entry_attrs["gen_ai.input.messages"])
+    assert entry_input[0]["role"] == "user"
+    assert entry_input[0]["parts"][0]["type"] == "text"
+    assert entry_input[0]["parts"][0]["content"] == "hello"
+    # ENTRY TTFT (was already emitted; ensure it stays a positive int)
+    assert entry_attrs.get("gen_ai.response.time_to_first_token") is not None
+    assert entry_attrs["gen_ai.response.time_to_first_token"] > 0
+
+    # AGENT: input.messages, output.messages, system_instructions,
+    # tool.definitions, TTFT
+    agent_attrs = dict(agent_span.attributes or {})
+    assert "gen_ai.input.messages" in agent_attrs
+    assert _json.loads(agent_attrs["gen_ai.input.messages"])[0]["role"] == "user"
+    assert "gen_ai.output.messages" in agent_attrs
+    agent_output = _json.loads(agent_attrs["gen_ai.output.messages"])
+    assert agent_output[0]["role"] == "assistant"
+    assert agent_output[0]["finish_reason"] == "stop"
+    assert "gen_ai.system_instructions" in agent_attrs
+    sys_instr = _json.loads(agent_attrs["gen_ai.system_instructions"])
+    assert sys_instr[0]["content"] == "You are a helpful assistant"
+    assert "gen_ai.tool.definitions" in agent_attrs
+    tool_defs = _json.loads(agent_attrs["gen_ai.tool.definitions"])
+    assert any(td.get("name") == "get_weather" for td in tool_defs)
+    assert any(td.get("type") == "computer" for td in tool_defs)
+    # Regression for verification non-blocking #5: AGENT TTFT was dropped
+    # because monotonic_first_token_s was set to a delta — now uses absolute
+    # perf_counter reading, so the handler emits the attribute.
+    assert "gen_ai.response.time_to_first_token" in agent_attrs
+    assert agent_attrs["gen_ai.response.time_to_first_token"] > 0

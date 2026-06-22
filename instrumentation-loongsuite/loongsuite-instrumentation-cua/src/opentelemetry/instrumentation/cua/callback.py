@@ -26,7 +26,14 @@ from opentelemetry.util.genai.extended_types import (
     InvokeAgentInvocation,
     ReactStepInvocation,
 )
-from opentelemetry.util.genai.types import Error
+from opentelemetry.util.genai.types import (
+    Error,
+    FunctionToolDefinition,
+    GenericToolDefinition,
+    InputMessage,
+    OutputMessage,
+    Text,
+)
 
 from opentelemetry.instrumentation.cua.utils import (
     action_description,
@@ -38,6 +45,130 @@ from opentelemetry.instrumentation.cua.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+GEN_AI_FRAMEWORK = "gen_ai.framework"
+_FRAMEWORK_VALUE = "cua"
+
+
+def _text_part(text: Any) -> Text:
+    return Text(content=str(text) if text is not None else "")
+
+
+def _messages_to_input_messages(messages: Any) -> List[InputMessage]:
+    """Convert a CUA/OpenAI-style messages list to ``InputMessage`` objects.
+
+    CUA messages look like ``[{"role": "user", "content": "..."}]``. We accept
+    both plain strings and lists of content parts (OpenAI format).
+    """
+    out: List[InputMessage] = []
+    if not isinstance(messages, list):
+        return out
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or "unknown"
+        content = msg.get("content")
+        parts: List[Any] = []
+        if content is None:
+            continue
+        if isinstance(content, str):
+            parts.append(_text_part(content))
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if text is not None:
+                        parts.append(_text_part(text))
+                elif isinstance(part, str):
+                    parts.append(_text_part(part))
+        elif isinstance(content, dict):
+            text = content.get("text") or content.get("content")
+            if text is not None:
+                parts.append(_text_part(text))
+        if parts:
+            out.append(InputMessage(role=role, parts=parts))
+    return out
+
+
+def _responses_to_output_messages(responses: Any) -> List[OutputMessage]:
+    """Convert CUA ``responses`` dict to ``OutputMessage`` objects.
+
+    ``responses`` typically looks like ``{"output": [{"role": "assistant",
+    "content": "..."}]}``. We only emit a structured message when textual
+    content is extractable; otherwise we return an empty list (the raw payload
+    is still surfaced on the LLM child span produced by LiteLLM instrumentation).
+    """
+    out: List[OutputMessage] = []
+    if not isinstance(responses, dict):
+        return out
+    items = responses.get("output") or responses.get("items")
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role") or item.get("type") or "assistant"
+        content = item.get("content")
+        parts: List[Any] = []
+        if isinstance(content, str) and content:
+            parts.append(_text_part(content))
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if text is not None:
+                        parts.append(_text_part(text))
+                elif isinstance(part, str):
+                    parts.append(_text_part(part))
+        if parts:
+            finish_reason = item.get("finish_reason") or "stop"
+            out.append(OutputMessage(role=role, parts=parts, finish_reason=finish_reason))
+    return out
+
+
+def _system_instruction_from_text(instructions: Any) -> List[Any]:
+    if instructions is None:
+        return []
+    if isinstance(instructions, str):
+        if not instructions:
+            return []
+        return [_text_part(instructions)]
+    return []
+
+
+def _extract_tool_definitions(agent: Any) -> List[Any]:
+    """Convert CUA ``ComputerAgent.tool_schemas`` entries to OTel ToolDefinition.
+
+    CUA's ``_process_tools`` emits entries shaped like
+    ``{"type": "computer", "computer": <obj>}`` or
+    ``{"type": "function", "function": {"name":..., "description":..., "parameters":...}}``.
+    We map them to ``GenericToolDefinition`` / ``FunctionToolDefinition`` so
+    the handler serializes ``gen_ai.tool.definitions`` (per gen-ai.md §[10/12]).
+    """
+    out: List[Any] = []
+    schemas = getattr(agent, "tool_schemas", None)
+    if not isinstance(schemas, list):
+        return out
+    for schema in schemas:
+        if not isinstance(schema, dict):
+            continue
+        t = schema.get("type")
+        if t == "function":
+            fn = schema.get("function") or {}
+            name = fn.get("name") or "function"
+            description = fn.get("description")
+            parameters = fn.get("parameters")
+            out.append(
+                FunctionToolDefinition(
+                    name=name,
+                    description=description,
+                    parameters=parameters if parameters is not None else {},
+                )
+            )
+        elif t:
+            name = schema.get("name") or t
+            out.append(GenericToolDefinition(name=name, type=t))
+    return out
 
 
 class ArmsCuaCallback:
@@ -63,6 +194,8 @@ class ArmsCuaCallback:
         self._first_token_ns: Optional[int] = None
         self._input_tokens: int = 0
         self._output_tokens: int = 0
+        self._input_messages: List[Dict[str, Any]] = []
+        self._last_responses: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -74,12 +207,14 @@ class ArmsCuaCallback:
         self._first_token_ns = None
         self._input_tokens = 0
         self._output_tokens = 0
+        self._input_messages = kwargs.get("messages") or []
 
         session_id = str(uuid4())
         self._entry_inv = EntryInvocation(
             session_id=session_id,
             user_id=kwargs.get("user_id"),
         )
+        self._entry_inv.attributes[GEN_AI_FRAMEWORK] = _FRAMEWORK_VALUE
         try:
             self._handler.start_entry(self._entry_inv)
         except Exception as exc:
@@ -99,6 +234,7 @@ class ArmsCuaCallback:
             conversation_id=session_id,
             request_model=model,
         )
+        self._agent_inv.attributes[GEN_AI_FRAMEWORK] = _FRAMEWORK_VALUE
         try:
             self._handler.start_invoke_agent(self._agent_inv)
         except Exception as exc:
@@ -115,13 +251,34 @@ class ArmsCuaCallback:
         self._fail_open_tool_span()
         self._close_open_step_span()
 
+        # Convert captured input messages / responses into the structured
+        # InputMessage / OutputMessage objects the handler knows how to
+        # serialize as gen_ai.input.messages / gen_ai.output.messages.
+        input_msgs = _messages_to_input_messages(self._input_messages)
+        output_msgs = _responses_to_output_messages(self._last_responses)
+        instructions = getattr(self._agent, "instructions", None)
+        system_instruction = _system_instruction_from_text(instructions)
+        tool_defs = _extract_tool_definitions(self._agent)
+
         if self._agent_inv is not None:
             self._agent_inv.input_tokens = self._input_tokens or None
             self._agent_inv.output_tokens = self._output_tokens or None
-            if self._first_token_ns is not None and self._run_start_ns:
-                self._agent_inv.monotonic_first_token_s = (
-                    (self._first_token_ns - self._run_start_ns) / 1e9
-                )
+            # The handler computes TTFT as
+            # ``(monotonic_first_token_s - monotonic_start_s) * 1e9`` where both
+            # values are absolute monotonic times (seconds). Earlier we set
+            # ``monotonic_first_token_s`` to a delta from ``_run_start_ns``,
+            # which made the comparison fail and dropped the attribute on
+            # AGENT. Use the absolute perf_counter reading instead.
+            if self._first_token_ns is not None:
+                self._agent_inv.monotonic_first_token_s = self._first_token_ns / 1e9
+            if input_msgs:
+                self._agent_inv.input_messages = input_msgs
+            if output_msgs:
+                self._agent_inv.output_messages = output_msgs
+            if system_instruction:
+                self._agent_inv.system_instruction = system_instruction
+            if tool_defs:
+                self._agent_inv.tool_definitions = tool_defs
             try:
                 self._handler.stop_invoke_agent(self._agent_inv)
             except Exception as exc:
@@ -133,6 +290,14 @@ class ArmsCuaCallback:
                 self._entry_inv.response_time_to_first_token = (
                     self._first_token_ns - self._run_start_ns
                 )
+            if input_msgs:
+                self._entry_inv.input_messages = input_msgs
+            if output_msgs:
+                self._entry_inv.output_messages = output_msgs
+            if system_instruction:
+                self._entry_inv.system_instruction = system_instruction
+            if tool_defs:
+                self._entry_inv.tool_definitions = tool_defs
             try:
                 self._handler.stop_entry(self._entry_inv)
             except Exception as exc:
@@ -151,6 +316,7 @@ class ArmsCuaCallback:
         self._fail_open_tool_span()
         self._close_open_step_span()
         self._step_inv = ReactStepInvocation(round=self._step_count)
+        self._step_inv.attributes[GEN_AI_FRAMEWORK] = _FRAMEWORK_VALUE
         try:
             self._handler.start_react_step(self._step_inv)
         except Exception as exc:
@@ -164,6 +330,10 @@ class ArmsCuaCallback:
     async def on_responses(self, kwargs: Dict[str, Any], responses: Dict[str, Any]) -> None:
         if self._first_token_ns is None:
             self._first_token_ns = time.perf_counter_ns()
+        # Stash the most recent responses so on_run_end can surface them as
+        # gen_ai.output.messages on the AGENT/ENTRY spans.
+        if isinstance(responses, dict):
+            self._last_responses = responses
         # Do NOT close the STEP span here: tool calls emitted in this response
         # are executed after on_responses returns and must remain children of
         # the STEP. We only record the finish_reason for later use.
@@ -185,6 +355,7 @@ class ArmsCuaCallback:
             tool_description=action_description(tool_name),
         )
         _set_optional_action_attrs(self._tool_inv.attributes, action)
+        self._tool_inv.attributes[GEN_AI_FRAMEWORK] = _FRAMEWORK_VALUE
         args_str = serialize_arguments(action)
         if args_str is not None:
             self._tool_inv.tool_call_arguments = args_str
@@ -215,6 +386,7 @@ class ArmsCuaCallback:
             tool_type="function",
             tool_description=name,
         )
+        self._tool_inv.attributes[GEN_AI_FRAMEWORK] = _FRAMEWORK_VALUE
         args_str = serialize_arguments(item.get("arguments") if isinstance(item, dict) else None)
         if args_str is not None:
             self._tool_inv.tool_call_arguments = args_str

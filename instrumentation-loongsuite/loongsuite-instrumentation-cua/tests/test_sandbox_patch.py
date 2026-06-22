@@ -482,3 +482,91 @@ def test_ephemeral_aenter_failure_marks_error_and_ends_span():
     assert attrs["cua.sandbox.name"] == "fail-ephemeral"
     assert "output.value" not in attrs
     assert "output.mime_type" not in attrs
+
+
+def test_task_spans_carry_gen_ai_framework_cua():
+    """Regression for verification non-blocking #4: every TASK span must
+    stamp ``gen_ai.framework=cua`` (per gen-ai.md §公共属性)."""
+    tracer, exporter = _make_tracer()
+
+    # create
+    create_wrapped = _wrap_create(tracer)
+
+    async def create_scenario():
+        return await create_wrapped(_async_create, None, ("ubuntu:24.04",), {"name": "sb-fw"})
+
+    _run(create_scenario())
+    span = exporter.get_finished_spans()[-1]
+    assert dict(span.attributes or {}).get("gen_ai.framework") == "cua"
+    exporter.clear()
+
+    # destroy with attrs on instance
+    destroy_wrapped = _wrap_destroy(tracer)
+
+    class _SandboxWithAttrs:
+        def __init__(self):
+            self.name = "sb-destroy-fw"
+            self.image = "ubuntu:24.04"
+            self.local = True
+            self.cpu = 4
+            self.memory_mb = 2048
+            self.region = "us-east-1"
+            self._runtime = _FakeRuntime()
+            self._transport = None
+
+    async def destroy_scenario():
+        return await destroy_wrapped(_async_destroy, _SandboxWithAttrs(), (), {})
+
+    _run(destroy_scenario())
+    span = exporter.get_finished_spans()[-1]
+    attrs = dict(span.attributes or {})
+    assert attrs["gen_ai.framework"] == "cua"
+    # Regression for verification non-blocking #6: destroy span must mirror
+    # create's cua.sandbox.* fields where the instance exposes them.
+    assert attrs["cua.sandbox.name"] == "sb-destroy-fw"
+    assert attrs["cua.sandbox.image"] == "ubuntu:24.04"
+    assert attrs["cua.sandbox.local"] is True
+    assert attrs["cua.sandbox.cpu"] == 4
+    assert attrs["cua.sandbox.memory_mb"] == 2048
+    assert attrs["cua.sandbox.region"] == "us-east-1"
+    assert attrs["cua.sandbox.runtime"] == "_FakeRuntime"
+    exporter.clear()
+
+    # connect
+    connect_wrapped = _wrap_connect(tracer)
+
+    async def connect_scenario():
+        return await connect_wrapped(_async_connect, None, ("sb-conn-fw",), {"local": False})
+
+    _run(connect_scenario())
+    span = exporter.get_finished_spans()[-1]
+    assert dict(span.attributes or {}).get("gen_ai.framework") == "cua"
+    exporter.clear()
+
+    # disconnect
+    disconnect_wrapped = _wrap_disconnect(tracer)
+    sb = _FakeSandbox(name="sb-disc-fw")
+
+    async def disconnect_scenario():
+        return await disconnect_wrapped(_async_disconnect, sb, (), {})
+
+    _run(disconnect_scenario())
+    span = exporter.get_finished_spans()[-1]
+    assert dict(span.attributes or {}).get("gen_ai.framework") == "cua"
+    exporter.clear()
+
+    # ephemeral
+    ephemeral_wrapped = _wrap_ephemeral(tracer)
+    sandbox = _FakeSandbox(name="sb-eph-fw")
+
+    def ephemeral_factory(image, **kwargs):
+        return _FakeAsyncCM(sandbox)
+
+    async def ephemeral_scenario():
+        cm = ephemeral_wrapped(ephemeral_factory, None, ("ubuntu",), {"name": "sb-eph-fw"})
+        async with cm:
+            pass
+
+    _run(ephemeral_scenario())
+    span = exporter.get_finished_spans()[-1]
+    assert dict(span.attributes or {}).get("gen_ai.framework") == "cua"

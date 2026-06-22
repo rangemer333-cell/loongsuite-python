@@ -53,6 +53,9 @@ from opentelemetry.instrumentation.cua.package import _instruments
 from opentelemetry.instrumentation.cua.version import __version__
 from opentelemetry.instrumentation.cua.callback import ArmsCuaCallback
 from opentelemetry.instrumentation.cua.sandbox_patch import (
+    GEN_AI_FRAMEWORK,
+    _FRAMEWORK_VALUE,
+    _apply_framework_attr,
     _wrap_connect,
     _wrap_destroy,
     _wrap_disconnect,
@@ -73,6 +76,42 @@ _CUA_SANDBOX_CLASS = "Sandbox"
 
 _ARMS_CALLBACK_ATTR = "_arms_cua_callback"
 
+# Resource attribute identifying the application as a GenAI app, per
+# ``/home/admin/semantic-conventions/arms_docs/trace/gen-ai.md`` §"应用特征".
+_ARMS_SERVICE_FEATURE_KEY = "acs.arms.service.feature"
+_ARMS_SERVICE_FEATURE_VALUE = "genai_app"
+
+
+def _merge_resource_attribute(tracer_provider: Any) -> None:
+    """Best-effort merge ``acs.arms.service.feature=genai_app`` onto the
+    tracer provider's resource.
+
+    Mutates ``tracer_provider._resource`` via ``Resource.merge``. Uses a
+    bare ``Resource({...})`` (no ``.create``) so the SDK defaults such as
+    ``service.name=unknown_service`` do NOT override the user's existing
+    resource. Safe no-op when the provider does not expose ``_resource``.
+    """
+    if tracer_provider is None:
+        return
+    try:
+        from opentelemetry.sdk.resources import Resource
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("CUA: opentelemetry.sdk.resources unavailable: %s", exc)
+        return
+    try:
+        current = getattr(tracer_provider, "_resource", None) or getattr(
+            tracer_provider, "resource", None
+        )
+        if current is None:
+            return
+        existing = getattr(current, "attributes", {}) or {}
+        if existing.get(_ARMS_SERVICE_FEATURE_KEY) == _ARMS_SERVICE_FEATURE_VALUE:
+            return
+        merged = current.merge(Resource({_ARMS_SERVICE_FEATURE_KEY: _ARMS_SERVICE_FEATURE_VALUE}))
+        tracer_provider._resource = merged
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("CUA: failed to merge resource attribute: %s", exc)
+
 
 class CuaInstrumentor(BaseInstrumentor):
     """Instrumentor for the CUA (Computer-Use Agent) framework."""
@@ -91,6 +130,17 @@ class CuaInstrumentor(BaseInstrumentor):
         tracer_provider = kwargs.get("tracer_provider")
         meter_provider = kwargs.get("meter_provider")
         logger_provider = kwargs.get("logger_provider")
+
+        # Tag the tracer provider's resource as a GenAI application so
+        # downstream ARMS collectors can identify it (per gen-ai.md §应用特征).
+        # Falls back to the global provider when ``tracer_provider`` is None.
+        _merge_resource_attribute(tracer_provider)
+        if tracer_provider is None:
+            try:
+                from opentelemetry.trace import get_tracer_provider as _gtp
+                _merge_resource_attribute(_gtp())
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("CUA: failed to tag global tracer provider: %s", exc)
 
         CuaInstrumentor._handler = ExtendedTelemetryHandler(
             tracer_provider=tracer_provider,
