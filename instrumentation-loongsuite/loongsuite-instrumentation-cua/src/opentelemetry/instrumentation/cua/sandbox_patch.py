@@ -201,6 +201,53 @@ def _wrap_destroy(tracer: trace.Tracer) -> Callable:
     return wrapper
 
 
+def _wrap_ephemeral(tracer: trace.Tracer) -> Callable:
+    """Wrap ``Sandbox.ephemeral`` (an ``@asynccontextmanager`` classmethod).
+
+    ``ephemeral`` calls ``Sandbox._create`` directly inside its async generator,
+    bypassing the patched ``Sandbox.create``. We wrap the returned context
+    manager so that ``__aenter__`` (which runs ``_create``) emits a
+    ``run_task sandbox.create`` TASK span with the same attributes as the
+    ``create`` wrapper. The ``destroy`` span is emitted separately by the
+    existing ``_wrap_destroy`` patch when ``ephemeral.__aexit__`` calls
+    ``sb.destroy()`` — so we end the create span before the body runs to keep
+    both TASK spans as independent roots (per ``execute.md`` §4.7).
+    """
+
+    def wrapper(wrapped, instance, args, kwargs):
+        cm = wrapped(*args, **kwargs)
+        attrs = _sandbox_attrs_before(args, kwargs)
+        input_payload = _sandbox_input_payload(args, kwargs)
+
+        class _TracedEphemeral:
+            async def __aenter__(self_inner):
+                span = _start_task_span(
+                    tracer, "run_task sandbox.create", attrs, input_payload
+                )
+                ctx = otel_context.attach(set_span_in_context(span))
+                self_inner._span = span
+                self_inner._ctx = ctx
+                try:
+                    sb = await cm.__aenter__()
+                    _set_runtime_attrs(span, sb)
+                    _set_output_payload(span, sb)
+                    return sb
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    raise
+                finally:
+                    otel_context.detach(ctx)
+                    span.end()
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return await cm.__aexit__(exc_type, exc, tb)
+
+        return _TracedEphemeral()
+
+    return wrapper
+
+
 def _wrap_connect(tracer: trace.Tracer) -> Callable:
     """Sandbox.connect returns a _ConnectResult awaiting the actual connect."""
     async def wrapper(wrapped, instance, args, kwargs):

@@ -57,6 +57,7 @@ from opentelemetry.instrumentation.cua.sandbox_patch import (
     _wrap_destroy,
     _wrap_disconnect,
     _wrap_create,
+    _wrap_ephemeral,
 )
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import unwrap
@@ -123,6 +124,7 @@ class CuaInstrumentor(BaseInstrumentor):
         tracer = get_tracer(__name__, __version__, tracer_provider=tracer_provider)
         for method, wrapper in (
             ("create", _wrap_create(tracer)),
+            ("ephemeral", _wrap_ephemeral(tracer)),
             ("destroy", _wrap_destroy(tracer)),
             ("connect", _wrap_connect(tracer)),
             ("disconnect", _wrap_disconnect(tracer)),
@@ -156,6 +158,7 @@ class CuaInstrumentor(BaseInstrumentor):
             from cua_sandbox.sandbox import Sandbox
 
             unwrap(Sandbox, "create")
+            unwrap(Sandbox, "ephemeral")
             unwrap(Sandbox, "destroy")
             unwrap(Sandbox, "connect")
             unwrap(Sandbox, "disconnect")

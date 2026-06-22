@@ -23,6 +23,7 @@ applied and removed correctly.
 import os
 import sys
 import types
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -61,6 +62,11 @@ def _install_stub_modules():
         @classmethod
         async def create(cls, image, **kwargs):
             return cls()
+
+        @classmethod
+        @asynccontextmanager
+        async def ephemeral(cls, image, **kwargs):
+            yield cls()
 
         @classmethod
         def connect(cls, name, **kwargs):

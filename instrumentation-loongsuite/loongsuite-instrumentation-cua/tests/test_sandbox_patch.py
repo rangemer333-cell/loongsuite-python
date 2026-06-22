@@ -30,6 +30,7 @@ from opentelemetry.instrumentation.cua.sandbox_patch import (
     _wrap_create,
     _wrap_destroy,
     _wrap_disconnect,
+    _wrap_ephemeral,
 )
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -324,5 +325,160 @@ def test_task_span_input_output_payloads_regression():
     attrs = dict(span.attributes or {})
     assert attrs["input.mime_type"] == "application/json"
     assert json.loads(attrs["input.value"]) == {"name": "sb-disconnect"}
+    assert "output.value" not in attrs
+    assert "output.mime_type" not in attrs
+
+
+class _FakeAsyncCM:
+    """A minimal stand-in for the ``_AsyncGeneratorContextManager`` returned
+    by ``Sandbox.ephemeral`` (which is ``@asynccontextmanager``-decorated)."""
+
+    def __init__(self, sandbox, on_aenter=None):
+        self._sandbox = sandbox
+        self._on_aenter = on_aenter
+
+    async def __aenter__(self):
+        if self._on_aenter is not None:
+            await self._on_aenter()
+        return self._sandbox
+
+    async def __aexit__(self, exc_type, exc, tb):
+        # Real ephemeral calls sb.destroy() here; the destroy patch emits its
+        # own TASK span — we do not duplicate it in the ephemeral wrapper.
+        return False
+
+
+def test_ephemeral_emits_create_task_span_on_aenter():
+    """Regression for verification must-fix #2: ``Sandbox.ephemeral`` calls
+    ``_create`` inside ``__aenter__`` (bypassing the patched ``create``), so
+    the ephemeral wrapper must emit the ``run_task sandbox.create`` TASK span
+    when entering the context manager."""
+    tracer, exporter = _make_tracer()
+    wrapped = _wrap_ephemeral(tracer)
+    sandbox = _FakeSandbox(name="sb-ephemeral")
+
+    def ephemeral_factory(image, **kwargs):
+        return _FakeAsyncCM(sandbox)
+
+    async def scenario():
+        cm = wrapped(ephemeral_factory, None, ("ubuntu:24.04",), {
+            "name": "sb-ephemeral",
+            "local": True,
+            "cpu": 2,
+            "memory_mb": 1024,
+            "region": "us-east-1",
+        })
+        async with cm as sb:
+            assert sb is sandbox
+            # The create span must be ended before the body runs, so the
+            # destroy span (emitted by the separate destroy patch) would be
+            # an independent root rather than a child of create.
+            assert len(exporter.get_finished_spans()) == 1
+
+    _run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.name == "run_task sandbox.create"
+    attrs = dict(span.attributes or {})
+    assert attrs["gen_ai.span.kind"] == "TASK"
+    assert attrs["gen_ai.operation.name"] == "run_task"
+    assert attrs["cua.sandbox.image"] == "ubuntu:24.04"
+    assert attrs["cua.sandbox.name"] == "sb-ephemeral"
+    assert attrs["cua.sandbox.local"] is True
+    assert attrs["cua.sandbox.cpu"] == 2
+    assert attrs["cua.sandbox.memory_mb"] == 1024
+    assert attrs["cua.sandbox.region"] == "us-east-1"
+    assert attrs["cua.sandbox.runtime"] == "_FakeRuntime"
+    assert attrs["input.mime_type"] == "application/json"
+    assert attrs["output.mime_type"] == "application/json"
+    input_payload = json.loads(attrs["input.value"])
+    assert input_payload["image"] == "ubuntu:24.04"
+    assert input_payload["name"] == "sb-ephemeral"
+    output_payload = json.loads(attrs["output.value"])
+    assert output_payload["name"] == "sb-ephemeral"
+    assert output_payload["runtime"] == "_FakeRuntime"
+
+
+def test_ephemeral_create_span_is_root_when_destroy_runs():
+    """The create span must be ended before ``__aexit__`` runs (which calls
+    destroy), so the destroy span is an independent root per execute.md §4.7.
+    We simulate the full ephemeral lifecycle including a destroy call inside
+    ``__aexit__``."""
+    tracer, exporter = _make_tracer()
+    create_wrapped = _wrap_create(tracer)
+    destroy_wrapped = _wrap_destroy(tracer)
+    sandbox = _FakeSandbox(name="sb-ephemeral-root")
+
+    async def destroy_via_patch():
+        # Simulate ephemeral.__aexit__ calling sb.destroy() through the
+        # patched destroy wrapper.
+        await destroy_wrapped(_async_destroy, sandbox, (), {})
+
+    class _CM:
+        async def __aenter__(self):
+            return sandbox
+
+        async def __aexit__(self, exc_type, exc, tb):
+            await destroy_via_patch()
+            return False
+
+    ephemeral_wrapped = _wrap_ephemeral(tracer)
+
+    def ephemeral_factory(image, **kwargs):
+        return _CM()
+
+    async def scenario():
+        cm = ephemeral_wrapped(ephemeral_factory, None, ("ubuntu:24.04",), {
+            "name": "sb-ephemeral-root",
+            "local": True,
+        })
+        async with cm:
+            pass
+
+    _run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2
+    create_span = next(s for s in spans if s.name == "run_task sandbox.create")
+    destroy_span = next(s for s in spans if s.name == "run_task sandbox.destroy")
+    # Both TASK spans must be independent roots — no parent.
+    assert create_span.parent is None
+    assert destroy_span.parent is None
+    # Create must end before destroy starts.
+    assert create_span.end_time <= destroy_span.start_time
+
+
+def test_ephemeral_aenter_failure_marks_error_and_ends_span():
+    tracer, exporter = _make_tracer()
+    wrapped = _wrap_ephemeral(tracer)
+
+    class _FailingCM:
+        async def __aenter__(self):
+            raise RuntimeError("sandbox create failed")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def ephemeral_factory(image, **kwargs):
+        return _FailingCM()
+
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            cm = wrapped(ephemeral_factory, None, ("ubuntu",), {"name": "fail-ephemeral"})
+            async with cm:
+                pass
+
+    _run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.name == "run_task sandbox.create"
+    assert span.status.is_ok is False
+    attrs = dict(span.attributes or {})
+    assert attrs["cua.sandbox.image"] == "ubuntu"
+    assert attrs["cua.sandbox.name"] == "fail-ephemeral"
     assert "output.value" not in attrs
     assert "output.mime_type" not in attrs
