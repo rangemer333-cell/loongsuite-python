@@ -40,6 +40,8 @@ import logging
 import timeit
 from typing import Any, Callable
 
+from opentelemetry.trace.status import Status, StatusCode
+
 from opentelemetry.util.genai.extended_handler import ExtendedTelemetryHandler
 from opentelemetry.util.genai.extended_types import (
     EntryInvocation,
@@ -62,6 +64,24 @@ logger = logging.getLogger(__name__)
 
 AG_UI_FRAMEWORK = "ag-ui"
 AG_UI_AGENT_NAME = "ag-ui"
+
+
+def _mark_span_ok(span: Any) -> None:
+    """Mark a span's status as OK before invoking ``stop_*`` callbacks.
+
+    The util-genai ``stop_*`` helpers do not set an explicit OK status on
+    the success path, leaving it as ``UNSET``. ``UNSET`` is semantically
+    ambiguous (span may not have been finalized), so we promote it to OK
+    explicitly to match the success semantics and the semantic convention's
+    expectation that successful runs surface a non-error status code.
+    """
+    if span is None:
+        return
+    try:
+        if span.is_recording():
+            span.set_status(Status(StatusCode.OK))
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 
 def _safe_get(obj: Any, name: str, default: Any = None) -> Any:
@@ -222,16 +242,23 @@ class AGUISpanManager:
         agent_inv.agent_id = run_id
         agent_inv.conversation_id = thread_id
         agent_inv.attributes["gen_ai.framework"] = AG_UI_FRAMEWORK
-        if self._config.capture_content and self._input_data is not None:
-            input_messages = convert_agui_messages_to_input_messages(
-                _safe_get(self._input_data, "messages")
-            )
-            agent_inv.input_messages = input_messages
+        if self._input_data is not None:
+            # Tool definitions are recorded even when capture_content is False
+            # because the util-genai writer only persists the tool ``name`` +
+            # ``type`` in that mode (no description / parameters). Gating this
+            # on capture_content caused ``gen_ai.tool.definitions`` to be
+            # missing on the AGENT span even when the request carried tools.
             tool_defs = convert_agui_tools_to_definitions(
                 _safe_get(self._input_data, "tools"),
                 capture_content=self._config.capture_content,
             )
-            agent_inv.tool_definitions = tool_defs
+            if tool_defs:
+                agent_inv.tool_definitions = tool_defs
+            if self._config.capture_content:
+                input_messages = convert_agui_messages_to_input_messages(
+                    _safe_get(self._input_data, "messages")
+                )
+                agent_inv.input_messages = input_messages
         self._safe_call(
             "start_invoke_agent", self._handler.start_invoke_agent, agent_inv
         )
@@ -302,6 +329,7 @@ class AGUISpanManager:
         step_inv = self._step_invs.pop(step_name, None)
         if step_inv is None:
             return
+        _mark_span_ok(step_inv.span)
         self._safe_call(
             "stop_react_step", self._handler.stop_react_step, step_inv
         )
@@ -394,6 +422,7 @@ class AGUISpanManager:
             "TOOL_CALL_END": self._on_tool_call_end,
             "TOOL_CALL_RESULT": self._on_tool_call_result,
             "TEXT_MESSAGE_CONTENT": self._on_text_content,
+            "TEXT_MESSAGE_CHUNK": self._on_text_content,
             "MESSAGES_SNAPSHOT": self._on_messages_snapshot,
         }
 
@@ -417,6 +446,7 @@ class AGUISpanManager:
             self._safe_fail_tool(inv, error)
             self._tool_states.pop(_safe_get(inv, "tool_call_id"), None)
             return
+        _mark_span_ok(inv.span)
         self._safe_call(
             "stop_execute_tool", self._handler.stop_execute_tool, inv
         )
@@ -439,6 +469,8 @@ class AGUISpanManager:
         for step_name, step_inv in list(self._step_invs.items()):
             if run_error:
                 step_inv.finish_reason = "error"
+            else:
+                _mark_span_ok(step_inv.span)
             self._safe_call(
                 "stop_react_step", self._handler.stop_react_step, step_inv
             )
@@ -458,6 +490,8 @@ class AGUISpanManager:
                 self._entry_inv.output_messages = output_messages
 
         if self._agent_inv is not None:
+            if not run_error:
+                _mark_span_ok(self._agent_inv.span)
             self._safe_call(
                 "stop_invoke_agent",
                 self._handler.stop_invoke_agent,
@@ -465,6 +499,8 @@ class AGUISpanManager:
             )
             self._agent_inv = None
         if self._entry_inv is not None:
+            if not run_error:
+                _mark_span_ok(self._entry_inv.span)
             self._safe_call(
                 "stop_entry", self._handler.stop_entry, self._entry_inv
             )

@@ -273,3 +273,74 @@ def test_session_id_and_user_id_from_input(handler, span_exporter):
     agent = next(s for s in spans if "invoke_agent" in s.name)
     assert agent.attributes["gen_ai.agent.id"] == "r-1"
     assert agent.attributes["gen_ai.conversation.id"] == "thread-42"
+
+
+# --- P2-1: TTFT must fire on TEXT_MESSAGE_CHUNK, not just CONTENT ----------
+def test_text_message_chunk_records_ttft(handler, span_exporter):
+    manager = AGUISpanManager(
+        handler=handler,
+        input_data=_input(),
+        config=AGUIConfig(capture_content=False),
+    )
+    manager.on_event(_evt("RUN_STARTED", thread_id="t", run_id="r"))
+    manager.on_event(
+        _evt("TEXT_MESSAGE_CHUNK", message_id="m1", delta="hello")
+    )
+    manager.on_event(_evt("RUN_FINISHED", thread_id="t", run_id="r"))
+
+    spans = span_exporter.get_finished_spans()
+    entry = next(s for s in spans if s.name == "enter_ai_application_system")
+    assert "gen_ai.response.time_to_first_token" in entry.attributes
+    assert entry.attributes["gen_ai.response.time_to_first_token"] > 0
+
+
+# --- P2-2: gen_ai.tool.definitions must be recorded even when capture_content is off ---
+def test_tool_definitions_recorded_without_capture_content(handler, span_exporter):
+    input_data = _input(
+        tools=[
+            SimpleNamespace(
+                name="get_weather",
+                description="Get weather",
+                parameters={"type": "object"},
+            )
+        ],
+    )
+    manager = AGUISpanManager(
+        handler=handler,
+        input_data=input_data,
+        config=AGUIConfig(capture_content=False),
+    )
+    manager.on_event(_evt("RUN_STARTED", thread_id="t", run_id="r"))
+    manager.on_event(_evt("RUN_FINISHED", thread_id="t", run_id="r"))
+
+    spans = span_exporter.get_finished_spans()
+    agent = next(s for s in spans if "invoke_agent" in s.name)
+    assert "gen_ai.tool.definitions" in agent.attributes
+    assert "get_weather" in agent.attributes["gen_ai.tool.definitions"]
+
+
+# --- P2-3: success path must set span status to OK -------------------------
+def test_success_path_sets_ok_status(handler, span_exporter):
+    from opentelemetry.trace.status import StatusCode
+
+    manager = AGUISpanManager(
+        handler=handler,
+        input_data=_input(),
+        config=AGUIConfig(capture_content=False),
+    )
+    manager.on_event(_evt("RUN_STARTED", thread_id="t", run_id="r"))
+    manager.on_event(_evt("STEP_STARTED", step_name="plan"))
+    manager.on_event(_evt("STEP_FINISHED", step_name="plan"))
+    manager.on_event(_evt("RUN_FINISHED", thread_id="t", run_id="r"))
+
+    spans = span_exporter.get_finished_spans()
+    for span in spans:
+        if span.name in {
+            "enter_ai_application_system",
+            "invoke_agent ag-ui",
+            "react step",
+        }:
+            assert span.status.status_code is StatusCode.OK, (
+                f"span {span.name} status was {span.status.status_code}"
+            )
+

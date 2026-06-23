@@ -125,3 +125,67 @@ def test_instrumentor_idempotent_when_sdk_missing(monkeypatch, tracer_provider):
 
     # Restore modules for subsequent tests.
     sys.modules.update({k: v for k, v in saved.items() if v is not None})
+
+
+def test_stack_walking_recovers_input_when_contextvar_empty(
+    monkeypatch, agui_sdk, tracer_provider, span_exporter
+):
+    """P1-1: when RunAgentInput.model_post_init does not fire (e.g. some
+    pydantic paths in crewai/langgraph integrations), the encoder init
+    must still recover the input by walking the call stack.
+    """
+    import sys
+
+    # Force the stub SDK to be the one in sys.modules. A previous test may
+    # have triggered real ``ag-ui-protocol`` import, which ``setdefault`` in
+    # the ``agui_sdk`` fixture cannot replace.
+    import types as _types
+
+    stub_encoder_mod = _types.ModuleType("ag_ui.encoder.encoder")
+    stub_encoder_mod.EventEncoder = agui_sdk.EventEncoder
+    stub_types_mod = _types.ModuleType("ag_ui.core.types")
+    stub_types_mod.RunAgentInput = agui_sdk.RunAgentInput
+    stub_types_mod.ConfiguredBaseModel = agui_sdk.ConfiguredBaseModel
+    sys.modules["ag_ui.encoder.encoder"] = stub_encoder_mod
+    sys.modules["ag_ui.core.types"] = stub_types_mod
+
+    import opentelemetry.instrumentation.ag_ui as agui_mod
+
+    importlib.reload(agui_mod)
+    instrumentor = _NoDepInstrumentor()
+    instrumentor.instrument(tracer_provider=tracer_provider)
+
+    RunAgentInput = agui_sdk.RunAgentInput
+    EventEncoder = agui_sdk.EventEncoder
+
+    # Construct an input WITHOUT triggering model_post_init (simulates the
+    # crewai/langgraph integration path where the ContextVar never gets set).
+    request_input = RunAgentInput.__new__(RunAgentInput)
+    request_input.messages = [
+        type("M", (), {"role": "user", "content": "hi"})()
+    ]
+    request_input.tools = []
+    request_input.forwarded_props = {}
+
+    # Create the encoder in a frame that has ``input_data`` as a local,
+    # mirroring the FastAPI endpoint pattern used by all integrations.
+    def endpoint_like(input_data):
+        encoder = EventEncoder()
+        encoder.encode(
+            type("Evt", (), {"type": "RUN_STARTED", "thread_id": "t", "run_id": "r"})()
+        )
+        encoder.encode(
+            type("Evt", (), {"type": "RUN_FINISHED", "thread_id": "t", "run_id": "r"})()
+        )
+        return encoder
+
+    endpoint_like(request_input)
+
+    instrumentor.uninstrument()
+
+    spans = span_exporter.get_finished_spans()
+    entry = next(s for s in spans if s.name == "enter_ai_application_system")
+    # If stack walking recovered the input, gen_ai.input.messages must be set
+    # because capture_content defaults to True under the conftest env.
+    assert "gen_ai.input.messages" in entry.attributes
+    assert "hi" in entry.attributes["gen_ai.input.messages"]

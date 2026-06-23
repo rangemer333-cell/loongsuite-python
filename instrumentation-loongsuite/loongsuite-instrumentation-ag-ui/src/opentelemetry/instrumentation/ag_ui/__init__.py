@@ -64,6 +64,62 @@ _global_config: AGUIConfig | None = None
 _original_post_init: Any = None
 
 
+def _is_run_agent_input(obj: Any) -> bool:
+    """Detect an AG-UI ``RunAgentInput`` instance without importing the SDK.
+
+    Falls back to duck-typing on class name + module so that the detection
+    works even when the real ``ag-ui-protocol`` package is not importable
+    from this process (e.g. during tests that use a stub SDK).
+    """
+    if obj is None:
+        return False
+    try:
+        cls = type(obj)
+    except Exception:
+        return False
+    cls_name = getattr(cls, "__name__", "") or ""
+    if cls_name != "RunAgentInput":
+        return False
+    module = getattr(cls, "__module__", "") or ""
+    if module.startswith("ag_ui"):
+        return True
+    # Duck-typing fallback: AG-UI RunAgentInput has these required fields.
+    return all(
+        hasattr(obj, attr)
+        for attr in ("messages", "tools", "forwarded_props")
+    )
+
+
+def _find_input_in_stack(max_frames: int = 16) -> Any:
+    """Walk the call stack looking for a ``RunAgentInput`` local variable.
+
+    All AG-UI framework integrations (LangGraph / CrewAI / Strands / ...) use
+    the same FastAPI pattern: the endpoint function receives a
+    ``RunAgentInput`` parameter and then constructs ``EventEncoder(...)`` in
+    the same frame. The ``RunAgentInput.model_post_init`` ContextVar hook is
+    the primary capture path, but some integrations construct the model via
+    pydantic paths that bypass our patch. Stack walking is a robust
+    fallback that works for every integration because the encoder is always
+    created inside the endpoint frame that holds ``input_data``.
+    """
+    import sys
+
+    frame = sys._getframe(1)  # skip this function's frame
+    seen = 0
+    while frame is not None and seen < max_frames:
+        local_input = frame.f_locals.get("input_data")
+        if _is_run_agent_input(local_input):
+            return local_input
+        # Some endpoints use ``run_input`` / ``request_input`` naming.
+        for alt_name in ("run_input", "request_input", "agent_input"):
+            alt = frame.f_locals.get(alt_name)
+            if _is_run_agent_input(alt):
+                return alt
+        frame = frame.f_back
+        seen += 1
+    return None
+
+
 def _patched_encoder_init(wrapped, instance, args, kwargs):
     wrapped(*args, **kwargs)
     if _global_handler is None or _global_config is None:
@@ -76,6 +132,16 @@ def _patched_encoder_init(wrapped, instance, args, kwargs):
     except ImportError:  # pragma: no cover - defensive
         return
     input_data = _current_agui_input.get(None)
+    if input_data is None:
+        # Fallback for integrations whose ``RunAgentInput`` construction
+        # path does not trigger ``model_post_init`` (e.g. CrewAI / LangGraph
+        # via certain pydantic validation paths). All integrations create
+        # the encoder inside the FastAPI endpoint frame that also holds the
+        # parsed ``input_data`` local, so stack walking recovers it.
+        try:
+            input_data = _find_input_in_stack()
+        except Exception:  # pragma: no cover - defensive
+            input_data = None
     instance._agui_span_manager = AGUISpanManager(
         handler=_global_handler,
         input_data=input_data,
